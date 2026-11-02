@@ -1,0 +1,29 @@
+Test run: 2026-11-01 12:04
+
+TC-01	PASS	Add a new book
+TC-02	PASS	Adding a duplicate barcode is refused
+TC-03	PASS	Adding a book with no title is refused
+TC-04	PASS	Search by part of a title finds the book
+TC-05	PASS	A search with no match returns an empty list
+TC-06	PASS	Register a member
+TC-07	PASS	Registering a duplicate member is refused
+TC-08	PASS	Issue an available book (due in 14 days, status On loan)
+TC-09	PASS	Issuing a book that is already on loan is refused
+TC-10	PASS	Issuing to an unknown member is refused
+TC-11	PASS	A 4th book is refused when the limit is 3
+TC-12	PASS	A member with an unpaid fine cannot borrow
+TC-13	PASS	Return a book on time (no fine, status Available)
+TC-14	PASS	Returning a book that is not on loan is refused
+TC-15	PASS	Returning a book 5 days late creates a fine of KES 50
+TC-16	PASS	Paying a fine lets the member borrow again
+TC-17	PASS	Overdue report lists the late book with days overdue
+TC-18	PASS	Dashboard totals change after a book is issued
+TC-19	PASS	Mark a book Missing; it can no longer be issued
+TC-20	PASS	A book on loan cannot be marked Missing
+TC-21	PASS	Search and dashboard respond in under 3 seconds
+TC-22	PASS	Login with a wrong password is refused
+TC-23	PASS	Login with correct details returns a token
+TC-24	PASS	A protected page refuses a request with no login
+TC-25	PASS	A librarian cannot add books (admin only)
+
+25 passed, 0 failed, 0 skipped

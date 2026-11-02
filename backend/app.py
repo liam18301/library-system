@@ -1,0 +1,426 @@
+"""
+Library Book Tracking & Circulation System - Flask API
+Run:  python app.py   (inside the activated venv, in the backend folder)
+API:  http://localhost:5000/api/...
+"""
+from datetime import date, timedelta
+
+from functools import wraps
+
+from flask import Flask, g, jsonify, request
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///library.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = "change-this-secret-key-before-real-use"
+CORS(app)  # lets the React app (localhost:5173) call this API
+db = SQLAlchemy(app)
+
+LOAN_DAYS = 14        # how long a book can be borrowed
+FINE_PER_DAY = 10     # fine in KES for each day overdue
+MAX_ACTIVE_LOANS = 3  # books one member can hold at a time
+
+
+# ----------------------------------------------------------------- MODELS
+class Category(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), unique=True, nullable=False)
+
+
+class Book(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    barcode = db.Column(db.String(40), unique=True, nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    author = db.Column(db.String(120), nullable=False)
+    isbn = db.Column(db.String(20))
+    category_id = db.Column(db.Integer, db.ForeignKey("category.id"))
+    shelf_location = db.Column(db.String(40))
+    # Available | On loan | Missing
+    status = db.Column(db.String(20), default="Available", nullable=False)
+    category = db.relationship("Category")
+
+    def to_dict(self):
+        return {
+            "id": self.id, "barcode": self.barcode, "title": self.title,
+            "author": self.author, "isbn": self.isbn,
+            "category": self.category.name if self.category else None,
+            "shelf_location": self.shelf_location, "status": self.status,
+        }
+
+
+class Member(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    reg_no = db.Column(db.String(30), unique=True, nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    faculty = db.Column(db.String(80))
+    email = db.Column(db.String(120))
+    phone = db.Column(db.String(30))
+    status = db.Column(db.String(20), default="Active", nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "reg_no": self.reg_no, "name": self.name,
+            "faculty": self.faculty, "email": self.email,
+            "phone": self.phone, "status": self.status,
+        }
+
+
+class Loan(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    member_id = db.Column(db.Integer, db.ForeignKey("member.id"), nullable=False)
+    book_id = db.Column(db.Integer, db.ForeignKey("book.id"), nullable=False)
+    issue_date = db.Column(db.Date, nullable=False)
+    due_date = db.Column(db.Date, nullable=False)
+    return_date = db.Column(db.Date)
+    member = db.relationship("Member")
+    book = db.relationship("Book")
+
+    def to_dict(self):
+        overdue = self.return_date is None and self.due_date < date.today()
+        return {
+            "id": self.id,
+            "member": self.member.name, "reg_no": self.member.reg_no,
+            "book": self.book.title, "barcode": self.book.barcode,
+            "issue_date": self.issue_date.isoformat(),
+            "due_date": self.due_date.isoformat(),
+            "return_date": self.return_date.isoformat() if self.return_date else None,
+            "overdue": overdue,
+            "days_overdue": (date.today() - self.due_date).days if overdue else 0,
+        }
+
+
+class Fine(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    loan_id = db.Column(db.Integer, db.ForeignKey("loan.id"), nullable=False)
+    amount = db.Column(db.Integer, nullable=False)
+    paid = db.Column(db.Boolean, default=False, nullable=False)
+    loan = db.relationship("Loan")
+
+    def to_dict(self):
+        return {
+            "id": self.id, "loan_id": self.loan_id, "amount": self.amount,
+            "paid": self.paid, "member": self.loan.member.name,
+            "reg_no": self.loan.member.reg_no, "book": self.loan.book.title,
+        }
+
+
+# ------------------------------------------------------------ USERS & AUTH
+TOKEN_HOURS = 8
+serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
+
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False)
+    full_name = db.Column(db.String(120), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    role = db.Column(db.String(20), nullable=False)  # admin | librarian
+
+    def to_dict(self):
+        return {"id": self.id, "username": self.username,
+                "full_name": self.full_name, "role": self.role}
+
+
+def require_role(*roles):
+    """Protect a route: caller must send a valid token with one of the roles."""
+    def wrap(fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            header = request.headers.get("Authorization", "")
+            if not header.startswith("Bearer "):
+                return jsonify({"error": "Login required"}), 401
+            try:
+                data = serializer.loads(header[7:], max_age=TOKEN_HOURS * 3600)
+            except BadSignature:
+                return jsonify({"error": "Session expired - please log in again"}), 401
+            if roles and data.get("role") not in roles:
+                return jsonify({"error": "You do not have permission to do this"}), 403
+            g.user = data
+            return fn(*args, **kwargs)
+        return inner
+    return wrap
+
+
+def seed_users():
+    """Creates two sample accounts the first time (change the passwords!)."""
+    if User.query.first():
+        return
+    db.session.add_all([
+        User(username="admin", full_name="Administrator", role="admin",
+             password_hash=generate_password_hash("admin123")),
+        User(username="librarian", full_name="Librarian", role="librarian",
+             password_hash=generate_password_hash("librarian123")),
+    ])
+    db.session.commit()
+
+
+# ------------------------------------------------------------------ HELPERS
+def error(message, code=400):
+    return jsonify({"error": message}), code
+
+
+def find_book(barcode):
+    return Book.query.filter_by(barcode=barcode).first()
+
+
+def find_member(reg_no):
+    return Member.query.filter_by(reg_no=reg_no).first()
+
+
+# ------------------------------------------------------------------- LOGIN
+@app.post("/api/login")
+def login():
+    d = request.get_json(silent=True) or {}
+    user = User.query.filter_by(username=(d.get("username") or "").strip()).first()
+    if not user or not check_password_hash(user.password_hash, d.get("password") or ""):
+        return error("Invalid username or password", 401)
+    token = serializer.dumps({"id": user.id, "role": user.role})
+    return jsonify({"token": token, "user": user.to_dict()})
+
+
+# ------------------------------------------------------------------- BOOKS
+@app.get("/api/books")
+def list_books():
+    return jsonify([b.to_dict() for b in Book.query.order_by(Book.title).all()])
+
+
+@app.post("/api/books")
+@require_role("admin")
+def add_book():
+    d = request.get_json(silent=True) or {}
+    if not d.get("barcode") or not d.get("title") or not d.get("author"):
+        return error("barcode, title and author are required")
+    if find_book(d["barcode"]):
+        return error("A book with this barcode already exists", 409)
+
+    category = None
+    if d.get("category"):
+        category = Category.query.filter_by(name=d["category"]).first()
+        if not category:
+            category = Category(name=d["category"])
+            db.session.add(category)
+            db.session.flush()
+
+    book = Book(
+        barcode=d["barcode"], title=d["title"], author=d["author"],
+        isbn=d.get("isbn"), shelf_location=d.get("shelf_location"),
+        category_id=category.id if category else None,
+    )
+    db.session.add(book)
+    db.session.commit()
+    return jsonify(book.to_dict()), 201
+
+
+@app.get("/api/books/search")
+def search_books():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+    like = f"%{q}%"
+    results = Book.query.filter(
+        db.or_(Book.title.ilike(like), Book.author.ilike(like),
+               Book.isbn.ilike(like), Book.barcode.ilike(like))
+    ).order_by(Book.title).all()
+    return jsonify([b.to_dict() for b in results])
+
+
+@app.put("/api/books/<int:book_id>/status")
+@require_role("admin")
+def set_book_status(book_id):
+    """Mark a book Missing / Available (used after stock-taking)."""
+    book = db.session.get(Book, book_id)
+    if not book:
+        return error("Book not found", 404)
+    status = (request.get_json(silent=True) or {}).get("status")
+    if status not in ("Available", "Missing"):
+        return error("status must be 'Available' or 'Missing'")
+    if book.status == "On loan":
+        return error("Book is on loan - return it first")
+    book.status = status
+    db.session.commit()
+    return jsonify(book.to_dict())
+
+
+# ----------------------------------------------------------------- MEMBERS
+@app.get("/api/members")
+@require_role("admin", "librarian")
+def list_members():
+    return jsonify([m.to_dict() for m in Member.query.order_by(Member.name).all()])
+
+
+@app.post("/api/members")
+@require_role("admin", "librarian")
+def add_member():
+    d = request.get_json(silent=True) or {}
+    if not d.get("reg_no") or not d.get("name"):
+        return error("reg_no and name are required")
+    if find_member(d["reg_no"]):
+        return error("A member with this registration number exists", 409)
+    member = Member(
+        reg_no=d["reg_no"], name=d["name"], faculty=d.get("faculty"),
+        email=d.get("email"), phone=d.get("phone"),
+    )
+    db.session.add(member)
+    db.session.commit()
+    return jsonify(member.to_dict()), 201
+
+
+# --------------------------------------------------------------- CIRCULATION
+@app.post("/api/loans")
+@require_role("admin", "librarian")
+def issue_book():
+    d = request.get_json(silent=True) or {}
+    member = find_member(d.get("reg_no", ""))
+    book = find_book(d.get("barcode", ""))
+
+    if not member:
+        return error("Member not found", 404)
+    if not book:
+        return error("Book not found", 404)
+    if member.status != "Active":
+        return error("Member account is not active")
+    if book.status != "Available":
+        return error(f"Book is not available (status: {book.status})")
+
+    unpaid = (Fine.query.join(Loan).filter(
+        Loan.member_id == member.id, Fine.paid.is_(False)).count())
+    if unpaid:
+        return error("Member has unpaid fines - clear them before borrowing")
+
+    active = Loan.query.filter_by(member_id=member.id, return_date=None).count()
+    if active >= MAX_ACTIVE_LOANS:
+        return error(f"Borrowing limit reached ({MAX_ACTIVE_LOANS} books)")
+
+    today = date.today()
+    loan = Loan(member_id=member.id, book_id=book.id,
+                issue_date=today, due_date=today + timedelta(days=LOAN_DAYS))
+    book.status = "On loan"
+    db.session.add(loan)
+    db.session.commit()
+    return jsonify(loan.to_dict()), 201
+
+
+@app.post("/api/returns")
+@require_role("admin", "librarian")
+def return_book():
+    d = request.get_json(silent=True) or {}
+    book = find_book(d.get("barcode", ""))
+    if not book:
+        return error("Book not found", 404)
+
+    loan = Loan.query.filter_by(book_id=book.id, return_date=None).first()
+    if not loan:
+        return error("This book is not currently on loan")
+
+    today = date.today()
+    loan.return_date = today
+    book.status = "Available"
+
+    fine_amount = 0
+    if today > loan.due_date:
+        fine_amount = (today - loan.due_date).days * FINE_PER_DAY
+        db.session.add(Fine(loan_id=loan.id, amount=fine_amount))
+
+    db.session.commit()
+    result = loan.to_dict()
+    result["fine"] = fine_amount
+    return jsonify(result)
+
+
+@app.get("/api/loans")
+@require_role("admin", "librarian")
+def list_loans():
+    """?status=active (default) | all"""
+    q = Loan.query
+    if request.args.get("status", "active") == "active":
+        q = q.filter(Loan.return_date.is_(None))
+    return jsonify([l.to_dict() for l in q.order_by(Loan.issue_date.desc()).all()])
+
+
+# ------------------------------------------------------------------- FINES
+@app.get("/api/fines")
+@require_role("admin", "librarian")
+def list_fines():
+    return jsonify([f.to_dict() for f in Fine.query.order_by(Fine.id.desc()).all()])
+
+
+@app.post("/api/fines/<int:fine_id>/pay")
+@require_role("admin", "librarian")
+def pay_fine(fine_id):
+    fine = db.session.get(Fine, fine_id)
+    if not fine:
+        return error("Fine not found", 404)
+    fine.paid = True
+    db.session.commit()
+    return jsonify(fine.to_dict())
+
+
+# ----------------------------------------------------------------- REPORTS
+@app.get("/api/reports/overdue")
+@require_role("admin", "librarian")
+def overdue_report():
+    loans = Loan.query.filter(
+        Loan.return_date.is_(None), Loan.due_date < date.today()
+    ).order_by(Loan.due_date).all()
+    return jsonify([l.to_dict() for l in loans])
+
+
+@app.get("/api/stats")
+@require_role("admin", "librarian")
+def stats():
+    """Numbers for the dashboard cards."""
+    return jsonify({
+        "total_books": Book.query.count(),
+        "available": Book.query.filter_by(status="Available").count(),
+        "on_loan": Book.query.filter_by(status="On loan").count(),
+        "missing": Book.query.filter_by(status="Missing").count(),
+        "members": Member.query.count(),
+        "overdue": Loan.query.filter(
+            Loan.return_date.is_(None), Loan.due_date < date.today()).count(),
+        "unpaid_fines": db.session.query(db.func.coalesce(db.func.sum(Fine.amount), 0))
+                          .filter(Fine.paid.is_(False)).scalar(),
+    })
+
+
+# -------------------------------------------------------------- SAMPLE DATA
+def seed():
+    """Adds sample data the first time the app runs (empty database)."""
+    if Book.query.first():
+        return
+    cats = {n: Category(name=n) for n in
+            ["Computing", "Business", "Education", "Law", "Science"]}
+    db.session.add_all(cats.values())
+    db.session.flush()
+
+    books = [
+        ("B0001", "Database System Concepts", "Silberschatz", "9780078022159", "Computing", "A1-01"),
+        ("B0002", "Software Engineering", "Ian Sommerville", "9780133943030", "Computing", "A1-02"),
+        ("B0003", "Research Methodology", "C. R. Kothari", "9788122436235", "Education", "C2-05"),
+        ("B0004", "Principles of Marketing", "Philip Kotler", "9780134492513", "Business", "B3-11"),
+        ("B0005", "Introduction to Algorithms", "Cormen et al.", "9780262033848", "Computing", "A1-07"),
+        ("B0006", "Business Law in Kenya", "Sample Author", "9789966000001", "Law", "D1-03"),
+    ]
+    for code, title, author, isbn, cat, shelf in books:
+        db.session.add(Book(barcode=code, title=title, author=author, isbn=isbn,
+                            category_id=cats[cat].id, shelf_location=shelf))
+
+    db.session.add_all([
+        Member(reg_no="19/00001", name="Sample Student One", faculty="Computing"),
+        Member(reg_no="19/00002", name="Sample Student Two", faculty="Business"),
+        Member(reg_no="STAFF001", name="Sample Lecturer", faculty="Computing"),
+    ])
+    db.session.commit()
+
+
+with app.app_context():
+    db.create_all()
+    seed()
+    seed_users()
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+    
